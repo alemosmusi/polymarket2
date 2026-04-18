@@ -583,36 +583,76 @@ class HighestTemperatureTracker:
         return extracted
 
     def _get_midpoints(self, token_ids: Sequence[str | None]) -> dict[str, float | None]:
-        cleaned = [t for t in token_ids if t]
+        cleaned = dedupe_preserve_order([t for t in token_ids if t])
         results: dict[str, float | None] = {}
         for chunk in chunked(cleaned, self.batch_size):
-            response = self.session.get(
+            payload = [{"token_id": token_id} for token_id in chunk]
+            response = self.session.post(
                 f"{CLOB_BASE}/midpoints",
-                params={"token_ids": ",".join(chunk)},
+                json=payload,
                 timeout=self.timeout_seconds,
             )
+            if response.status_code == 400:
+                for token_id in chunk:
+                    single = self.session.get(
+                        f"{CLOB_BASE}/midpoint",
+                        params={"token_id": token_id},
+                        timeout=self.timeout_seconds,
+                    )
+                    if single.status_code in (400, 404):
+                        results[str(token_id)] = None
+                        continue
+                    single.raise_for_status()
+                    data = single.json()
+                    if isinstance(data, dict):
+                        results[str(token_id)] = to_float_or_none(
+                            data.get("mid_price") or data.get("midpoint") or data.get("price")
+                        )
+                    else:
+                        results[str(token_id)] = None
+                continue
             response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise RuntimeError(f"Unexpected midpoints payload: {type(payload)!r}")
-            for token_id, value in payload.items():
+            data = response.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Unexpected midpoints payload: {type(data)!r}")
+            for token_id, value in data.items():
                 results[str(token_id)] = to_float_or_none(value)
         return results
 
     def _get_prices(self, token_ids: Sequence[str | None], side: str) -> dict[str, float | None]:
-        cleaned = [t for t in token_ids if t]
+        cleaned = dedupe_preserve_order([t for t in token_ids if t])
         results: dict[str, float | None] = {}
         for chunk in chunked(cleaned, self.batch_size):
-            response = self.session.get(
+            payload = [{"token_id": token_id, "side": side} for token_id in chunk]
+            response = self.session.post(
                 f"{CLOB_BASE}/prices",
-                params={"token_ids": ",".join(chunk), "sides": ",".join([side] * len(chunk))},
+                json=payload,
                 timeout=self.timeout_seconds,
             )
+            if response.status_code == 400:
+                for token_id in chunk:
+                    single = self.session.get(
+                        f"{CLOB_BASE}/price",
+                        params={"token_id": token_id, "side": side},
+                        timeout=self.timeout_seconds,
+                    )
+                    if single.status_code in (400, 404):
+                        results[str(token_id)] = None
+                        continue
+                    single.raise_for_status()
+                    data = single.json()
+                    if isinstance(data, dict):
+                        results[str(token_id)] = to_float_or_none(
+                            data.get("price") or data.get(side)
+                        )
+                    else:
+                        results[str(token_id)] = None
+                continue
             response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise RuntimeError(f"Unexpected prices payload: {type(payload)!r}")
-            for token_id, side_map in payload.items():
+            data = response.json()
+            if not isinstance(data, dict):
+                raise RuntimeError(f"Unexpected prices payload: {type(data)!r}")
+            for token_id, side_map in data.items():
                 if isinstance(side_map, dict):
                     results[str(token_id)] = to_float_or_none(side_map.get(side))
                 else:
