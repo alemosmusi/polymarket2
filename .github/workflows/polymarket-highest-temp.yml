@@ -11,7 +11,7 @@ permissions:
 jobs:
   track:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 8
 
     steps:
       - name: Checkout repo
@@ -34,7 +34,7 @@ jobs:
 
       - name: Run tracker once
         run: |
-          python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db run-once
+          python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db --batch-size 25 run-once
 
       - name: Export CSV snapshots
         run: |
