@@ -34,12 +34,12 @@ jobs:
 
       - name: Run tracker once
         run: |
-          python polymarket_highest_temp_tracker_v2.py run-once --db data/polymarket_highest_temp.db
+          python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db run-once
 
       - name: Export CSV snapshots
         run: |
-          python polymarket_highest_temp_tracker_v2.py export-csv --db data/polymarket_highest_temp.db --out data/snapshots.csv
-          python polymarket_highest_temp_tracker_v2.py export-picks-csv --db data/polymarket_highest_temp.db --out data/picks.csv
+          python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-csv --out data/snapshots.csv
+          python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-picks-csv --out data/picks.csv
 
       - name: Commit updated data
         run: |
