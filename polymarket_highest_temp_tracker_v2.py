@@ -1185,6 +1185,19 @@ def parse_flexible_date(text: str) -> str | None:
 
 def parse_outcome_range(label: str) -> dict[str, float | None]:
     text = collapse_space(label.strip())
+
+    # Outcome labels often come in as full questions, e.g.
+    # "Will the highest temperature in Milan be 21°C on April 21?"
+    # or "Will the highest temperature in Milan be 12°C or below on April 21?"
+    # Extract the temperature fragment after "be" and before the date/question ending.
+    question_match = re.search(
+        r"\bbe\s+(-?\d+(?:\.\d+)?\s*°?\s*[CF](?:\s*or\s*(?:below|higher|above))?(?:\s*-\s*-?\d+(?:\.\d+)?\s*°?\s*[CF])?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if question_match:
+        text = collapse_space(question_match.group(1))
+
     # Exact single value like "33°C"
     m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])", text, flags=re.IGNORECASE)
     if m:
@@ -1207,8 +1220,8 @@ def parse_outcome_range(label: str) -> dict[str, float | None]:
         unit = m.group(2).upper()
         return {"lower_bound": None, "upper_bound": value, "unit": unit}
 
-    # "31°C or above"
-    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])\s+or\s+above", text, flags=re.IGNORECASE)
+    # "31°C or higher" / "31°C or above"
+    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])\s+or\s+(?:higher|above)", text, flags=re.IGNORECASE)
     if m:
         value = float(m.group(1))
         unit = m.group(2).upper()
