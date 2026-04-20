@@ -5,7 +5,13 @@ cd /app
 
 mkdir -p data
 
-python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db --batch-size 25 run-once
+STOP_TRACKING_DAYS_AFTER_EVENT="${STOP_TRACKING_DAYS_AFTER_EVENT:-1}"
+
+python polymarket_highest_temp_tracker_v2.py \
+  --db data/polymarket_highest_temp.db \
+  --batch-size 25 \
+  --stop-tracking-days-after-event "${STOP_TRACKING_DAYS_AFTER_EVENT}" \
+  run-once
 python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-csv --out data/snapshots.csv
 python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-picks-csv --out data/picks.csv
 

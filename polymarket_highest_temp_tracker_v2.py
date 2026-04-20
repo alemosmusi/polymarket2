@@ -8,8 +8,8 @@ Features
   "Highest temperature in ".
 - Supports aligned polling at minutes 1, 6, 11, 16, ... by default.
 - Stores every binary child market (one outcome label per market) in SQLite.
-- Captures current YES midpoint, best bid (what you can sell into),
-  best ask (what you can buy at), and spread.
+- Captures current YES and NO midpoint/best bid/best ask, and YES spread.
+- Tracks only newly discovered events by default, then snapshots them every run.
 - When an event is first seen, fetches a "forecast pick":
   1) best effort parse from the Polymarket event page AI summary
   2) fallback to Open-Meteo geocoding + forecast API
@@ -57,6 +57,7 @@ DEFAULT_PAGE_SIZE = 500
 DEFAULT_BATCH_SIZE = 100
 DEFAULT_POLL_MINUTES = 5
 DEFAULT_ALIGN_START_MINUTE = 1
+DEFAULT_STOP_TRACKING_DAYS_AFTER_EVENT = 1
 TITLE_PREFIX = "highest temperature in "
 
 
@@ -162,6 +163,9 @@ class HighestTemperatureTracker:
                     unit TEXT,
                     station_name TEXT,
                     resolution_source_url TEXT,
+                    tracking_active INTEGER NOT NULL DEFAULT 0,
+                    tracking_started_at_utc TEXT,
+                    tracking_stopped_at_utc TEXT,
                     first_seen_at_utc TEXT NOT NULL,
                     last_seen_at_utc TEXT NOT NULL,
                     raw_json TEXT NOT NULL
@@ -188,9 +192,15 @@ class HighestTemperatureTracker:
                     initial_yes_midpoint REAL,
                     initial_yes_bid REAL,
                     initial_yes_ask REAL,
+                    initial_no_midpoint REAL,
+                    initial_no_bid REAL,
+                    initial_no_ask REAL,
                     latest_yes_midpoint REAL,
                     latest_yes_bid REAL,
                     latest_yes_ask REAL,
+                    latest_no_midpoint REAL,
+                    latest_no_bid REAL,
+                    latest_no_ask REAL,
                     latest_spread REAL,
                     active INTEGER NOT NULL DEFAULT 1,
                     raw_json TEXT NOT NULL,
@@ -209,6 +219,9 @@ class HighestTemperatureTracker:
                     yes_midpoint REAL,
                     yes_bid REAL,
                     yes_ask REAL,
+                    no_midpoint REAL,
+                    no_bid REAL,
+                    no_ask REAL,
                     spread REAL,
                     UNIQUE(captured_at_utc, market_id)
                 )
@@ -258,34 +271,52 @@ class HighestTemperatureTracker:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_market_time ON snapshots(market_id, captured_at_utc)"
             )
+            self._run_schema_migrations(conn)
 
-    def run_once(self) -> dict[str, int]:
+    def _run_schema_migrations(self, conn: sqlite3.Connection) -> None:
+        self._ensure_column(conn, "events", "tracking_active", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column(conn, "events", "tracking_started_at_utc", "TEXT")
+        self._ensure_column(conn, "events", "tracking_stopped_at_utc", "TEXT")
+        self._ensure_column(conn, "markets", "initial_no_midpoint", "REAL")
+        self._ensure_column(conn, "markets", "initial_no_bid", "REAL")
+        self._ensure_column(conn, "markets", "initial_no_ask", "REAL")
+        self._ensure_column(conn, "markets", "latest_no_midpoint", "REAL")
+        self._ensure_column(conn, "markets", "latest_no_bid", "REAL")
+        self._ensure_column(conn, "markets", "latest_no_ask", "REAL")
+        self._ensure_column(conn, "snapshots", "no_midpoint", "REAL")
+        self._ensure_column(conn, "snapshots", "no_bid", "REAL")
+        self._ensure_column(conn, "snapshots", "no_ask", "REAL")
+
+    def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, column_def: str) -> None:
+        existing = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column in existing:
+            return
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_def}")
+
+    def run_once(self, stop_tracking_days_after_event: int = DEFAULT_STOP_TRACKING_DAYS_AFTER_EVENT) -> dict[str, int]:
         now = utc_now_iso()
         events = list(self._fetch_active_events())
         highest_events = self._extract_highest_temp_events(events)
         markets = self._extract_markets(highest_events)
 
-        yes_token_ids = [m.yes_token_id for m in markets if m.yes_token_id]
-        midpoints = self._get_midpoints(yes_token_ids)
-        bids = self._get_prices(yes_token_ids, side="BUY")
-        asks = self._get_prices(yes_token_ids, side="SELL")
-
         current_event_ids = {e.event_id for e in highest_events}
         current_market_ids = {m.market_id for m in markets}
+        event_by_id = {event.event_id: event for event in highest_events}
         new_events = 0
         new_markets = 0
         snapshot_count = 0
+
+        existing_event_ids: set[str] = set()
+        existing_market_ids: set[str] = set()
+        tracked_event_ids: set[str] = set()
+        new_event_ids: set[str] = set()
 
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.row_factory = sqlite3.Row
 
-            existing_event_ids = {
-                row[0] for row in conn.execute("SELECT event_id FROM events")
-            }
-            existing_market_ids = {
-                row[0] for row in conn.execute("SELECT market_id FROM markets")
-            }
+            existing_event_ids = {row[0] for row in conn.execute("SELECT event_id FROM events")}
+            existing_market_ids = {row[0] for row in conn.execute("SELECT market_id FROM markets")}
 
             for event in highest_events:
                 station_name = None
@@ -300,22 +331,75 @@ class HighestTemperatureTracker:
                 )
                 if event.event_id not in existing_event_ids:
                     new_events += 1
+                    new_event_ids.add(event.event_id)
+                    self._activate_event_tracking(conn, event.event_id, now)
 
             for market in markets:
                 is_new = market.market_id not in existing_market_ids
                 if is_new:
                     new_markets += 1
-                self._upsert_market(conn, market, now, midpoints, bids, asks, is_new=is_new)
-                self._insert_snapshot(conn, market, now, midpoints, bids, asks)
-                snapshot_count += 1
+                self._upsert_market(conn, market, now, {}, {}, {}, {}, {}, {}, is_new=is_new)
 
             self._mark_missing_markets_inactive(conn, current_market_ids)
+            self._deactivate_stale_event_tracking(
+                conn=conn,
+                now=now,
+                grace_days=max(0, stop_tracking_days_after_event),
+            )
+            self._deactivate_older_tracked_event_dates(conn=conn, now=now)
+            tracked_event_ids = self._load_tracked_event_ids(conn)
+            tracked_event_ids = tracked_event_ids.intersection(current_event_ids)
+            conn.commit()
 
-            # Create first-seen forecast picks for new events only.
-            for event in highest_events:
-                if event.event_id in existing_event_ids:
+        tracked_markets = [market for market in markets if market.event_id in tracked_event_ids]
+        yes_token_ids = [m.yes_token_id for m in tracked_markets if m.yes_token_id]
+        no_token_ids = [m.no_token_id for m in tracked_markets if m.no_token_id]
+        yes_midpoints = self._get_midpoints(yes_token_ids)
+        yes_bids = self._get_prices(yes_token_ids, side="BUY")
+        yes_asks = self._get_prices(yes_token_ids, side="SELL")
+        no_midpoints = self._get_midpoints(no_token_ids)
+        no_bids = self._get_prices(no_token_ids, side="BUY")
+        no_asks = self._get_prices(no_token_ids, side="SELL")
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.row_factory = sqlite3.Row
+
+            for market in tracked_markets:
+                is_new = market.market_id not in existing_market_ids
+                self._upsert_market(
+                    conn,
+                    market,
+                    now,
+                    yes_midpoints,
+                    yes_bids,
+                    yes_asks,
+                    no_midpoints,
+                    no_bids,
+                    no_asks,
+                    is_new=is_new,
+                )
+                self._insert_snapshot(
+                    conn,
+                    market,
+                    now,
+                    yes_midpoints,
+                    yes_bids,
+                    yes_asks,
+                    no_midpoints,
+                    no_bids,
+                    no_asks,
+                )
+                snapshot_count += 1
+
+            # Create first-seen forecast picks for newly discovered tracked events only.
+            for event_id in new_event_ids:
+                if event_id not in tracked_event_ids:
                     continue
-                event_markets = [m for m in markets if m.event_id == event.event_id]
+                event = event_by_id.get(event_id)
+                if event is None:
+                    continue
+                event_markets = [m for m in tracked_markets if m.event_id == event.event_id]
                 if not event_markets:
                     continue
                 resolution_meta = self._fetch_resolution_meta(event.url)
@@ -335,16 +419,17 @@ class HighestTemperatureTracker:
                     )
                 forecast = self._get_initial_forecast(event, event_markets)
                 if forecast:
-                    self._create_forecast_pick(conn, event, event_markets, forecast, now, midpoints, bids, asks)
+                    self._create_forecast_pick(conn, event, event_markets, forecast, now, yes_midpoints, yes_bids, yes_asks)
 
             # Update existing forecast picks with current prices.
-            self._refresh_forecast_picks(conn, now, midpoints, bids, asks)
+            self._refresh_forecast_picks(conn, now, yes_midpoints, yes_bids, yes_asks)
             conn.commit()
 
         return {
             "events_scanned": len(events),
             "highest_temp_events": len(highest_events),
-            "markets_tracked": len(markets),
+            "markets_discovered": len(markets),
+            "markets_tracked": len(tracked_markets),
             "new_events": new_events,
             "new_markets": new_markets,
             "snapshots_inserted": snapshot_count,
@@ -354,6 +439,7 @@ class HighestTemperatureTracker:
         self,
         interval_minutes: int = DEFAULT_POLL_MINUTES,
         start_minute: int = DEFAULT_ALIGN_START_MINUTE,
+        stop_tracking_days_after_event: int = DEFAULT_STOP_TRACKING_DAYS_AFTER_EVENT,
     ) -> None:
         interval_minutes = max(1, interval_minutes)
         start_minute = start_minute % interval_minutes
@@ -368,7 +454,7 @@ class HighestTemperatureTracker:
             time.sleep(sleep_seconds)
             started = time.time()
             try:
-                summary = self.run_once()
+                summary = self.run_once(stop_tracking_days_after_event=stop_tracking_days_after_event)
                 logging.info("Run summary: %s", summary)
             except Exception:
                 logging.exception("Run failed")
@@ -400,6 +486,55 @@ class HighestTemperatureTracker:
             conn.row_factory = sqlite3.Row
             return [dict(row) for row in conn.execute(query, (limit,))]
 
+    def report_launch_prices(self, limit_events: int = 3) -> list[dict[str, Any]]:
+        query = """
+            WITH latest_events AS (
+                SELECT
+                    e.event_id,
+                    e.title,
+                    e.city,
+                    e.event_date_iso,
+                    e.event_url,
+                    COALESCE(e.tracking_started_at_utc, e.first_seen_at_utc) AS launch_seen_at_utc
+                FROM events e
+                ORDER BY launch_seen_at_utc DESC
+                LIMIT ?
+            )
+            SELECT
+                le.event_id,
+                le.title AS event_title,
+                le.city,
+                le.event_date_iso,
+                le.event_url,
+                le.launch_seen_at_utc,
+                m.market_id,
+                m.outcome_label,
+                m.unit,
+                m.lower_bound,
+                m.upper_bound,
+                m.initial_yes_bid,
+                m.initial_yes_ask,
+                m.initial_no_bid,
+                m.initial_no_ask,
+                fp.forecast_method,
+                fp.forecast_source_name,
+                fp.forecast_target_market_unit,
+                fp.market_unit AS forecast_market_unit,
+                fp.picked_outcome_label
+            FROM latest_events le
+            JOIN markets m ON m.event_id = le.event_id
+            LEFT JOIN forecast_picks fp ON fp.event_id = le.event_id
+            ORDER BY
+                le.launch_seen_at_utc DESC,
+                le.event_title ASC,
+                CASE WHEN m.lower_bound IS NULL THEN -999999 ELSE m.lower_bound END ASC,
+                CASE WHEN m.upper_bound IS NULL THEN 999999 ELSE m.upper_bound END ASC,
+                m.outcome_label ASC
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            return [dict(row) for row in conn.execute(query, (limit_events,))]
+
     def export_csv(self, output_path: str) -> int:
         query = """
             SELECT
@@ -415,9 +550,15 @@ class HighestTemperatureTracker:
                 m.initial_yes_midpoint,
                 m.initial_yes_bid,
                 m.initial_yes_ask,
+                m.initial_no_midpoint,
+                m.initial_no_bid,
+                m.initial_no_ask,
                 s.yes_midpoint,
                 s.yes_bid,
                 s.yes_ask,
+                s.no_midpoint,
+                s.no_bid,
+                s.no_ask,
                 s.spread
             FROM snapshots s
             JOIN markets m ON m.market_id = s.market_id
@@ -672,8 +813,9 @@ class HighestTemperatureTracker:
             """
             INSERT INTO events (
                 event_id, title, slug, event_url, city, event_date_iso, end_date, tags_json,
-                unit, station_name, resolution_source_url, first_seen_at_utc, last_seen_at_utc, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                unit, station_name, resolution_source_url, tracking_active, tracking_started_at_utc,
+                tracking_stopped_at_utc, first_seen_at_utc, last_seen_at_utc, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?)
             ON CONFLICT(event_id) DO UPDATE SET
                 title=excluded.title,
                 slug=excluded.slug,
@@ -711,16 +853,25 @@ class HighestTemperatureTracker:
         conn: sqlite3.Connection,
         market: MarketRecord,
         now: str,
-        midpoints: dict[str, float | None],
-        bids: dict[str, float | None],
-        asks: dict[str, float | None],
+        yes_midpoints: dict[str, float | None],
+        yes_bids: dict[str, float | None],
+        yes_asks: dict[str, float | None],
+        no_midpoints: dict[str, float | None],
+        no_bids: dict[str, float | None],
+        no_asks: dict[str, float | None],
         is_new: bool,
     ) -> None:
-        token_id = market.yes_token_id or ""
-        mid = midpoints.get(token_id) if token_id else None
-        bid = bids.get(token_id) if token_id else None
-        ask = asks.get(token_id) if token_id else None
-        spread = compute_spread(bid, ask)
+        yes_token_id = market.yes_token_id or ""
+        yes_mid = yes_midpoints.get(yes_token_id) if yes_token_id else None
+        yes_bid = yes_bids.get(yes_token_id) if yes_token_id else None
+        yes_ask = yes_asks.get(yes_token_id) if yes_token_id else None
+        no_token_id = market.no_token_id or ""
+        no_mid = no_midpoints.get(no_token_id) if no_token_id else None
+        no_bid = no_bids.get(no_token_id) if no_token_id else None
+        no_ask = no_asks.get(no_token_id) if no_token_id else None
+        spread = compute_spread(yes_bid, yes_ask)
+        has_yes_quote = int(any(value is not None for value in (yes_mid, yes_bid, yes_ask)))
+        has_no_quote = int(any(value is not None for value in (no_mid, no_bid, no_ask)))
 
         if is_new:
             conn.execute(
@@ -730,9 +881,11 @@ class HighestTemperatureTracker:
                     outcome_label, unit, lower_bound, upper_bound, tags_json,
                     first_seen_at_utc, last_seen_at_utc,
                     initial_yes_midpoint, initial_yes_bid, initial_yes_ask,
+                    initial_no_midpoint, initial_no_bid, initial_no_ask,
                     latest_yes_midpoint, latest_yes_bid, latest_yes_ask, latest_spread,
+                    latest_no_midpoint, latest_no_bid, latest_no_ask,
                     active, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                 """,
                 (
                     market.market_id,
@@ -749,13 +902,19 @@ class HighestTemperatureTracker:
                     json.dumps(market.tags, ensure_ascii=False),
                     now,
                     now,
-                    mid,
-                    bid,
-                    ask,
-                    mid,
-                    bid,
-                    ask,
+                    yes_mid,
+                    yes_bid,
+                    yes_ask,
+                    no_mid,
+                    no_bid,
+                    no_ask,
+                    yes_mid,
+                    yes_bid,
+                    yes_ask,
                     spread,
+                    no_mid,
+                    no_bid,
+                    no_ask,
                     json.dumps(market.raw_market, ensure_ascii=False),
                 ),
             )
@@ -776,10 +935,13 @@ class HighestTemperatureTracker:
                 upper_bound = ?,
                 tags_json = ?,
                 last_seen_at_utc = ?,
-                latest_yes_midpoint = ?,
-                latest_yes_bid = ?,
-                latest_yes_ask = ?,
-                latest_spread = ?,
+                latest_yes_midpoint = CASE WHEN ? = 1 THEN ? ELSE latest_yes_midpoint END,
+                latest_yes_bid = CASE WHEN ? = 1 THEN ? ELSE latest_yes_bid END,
+                latest_yes_ask = CASE WHEN ? = 1 THEN ? ELSE latest_yes_ask END,
+                latest_spread = CASE WHEN ? = 1 THEN ? ELSE latest_spread END,
+                latest_no_midpoint = CASE WHEN ? = 1 THEN ? ELSE latest_no_midpoint END,
+                latest_no_bid = CASE WHEN ? = 1 THEN ? ELSE latest_no_bid END,
+                latest_no_ask = CASE WHEN ? = 1 THEN ? ELSE latest_no_ask END,
                 active = 1,
                 raw_json = ?
             WHERE market_id = ?
@@ -797,10 +959,20 @@ class HighestTemperatureTracker:
                 market.upper_bound,
                 json.dumps(market.tags, ensure_ascii=False),
                 now,
-                mid,
-                bid,
-                ask,
+                has_yes_quote,
+                yes_mid,
+                has_yes_quote,
+                yes_bid,
+                has_yes_quote,
+                yes_ask,
+                has_yes_quote,
                 spread,
+                has_no_quote,
+                no_mid,
+                has_no_quote,
+                no_bid,
+                has_no_quote,
+                no_ask,
                 json.dumps(market.raw_market, ensure_ascii=False),
                 market.market_id,
             ),
@@ -811,22 +983,30 @@ class HighestTemperatureTracker:
         conn: sqlite3.Connection,
         market: MarketRecord,
         now: str,
-        midpoints: dict[str, float | None],
-        bids: dict[str, float | None],
-        asks: dict[str, float | None],
+        yes_midpoints: dict[str, float | None],
+        yes_bids: dict[str, float | None],
+        yes_asks: dict[str, float | None],
+        no_midpoints: dict[str, float | None],
+        no_bids: dict[str, float | None],
+        no_asks: dict[str, float | None],
     ) -> None:
-        token_id = market.yes_token_id or ""
-        mid = midpoints.get(token_id) if token_id else None
-        bid = bids.get(token_id) if token_id else None
-        ask = asks.get(token_id) if token_id else None
-        spread = compute_spread(bid, ask)
+        yes_token_id = market.yes_token_id or ""
+        yes_mid = yes_midpoints.get(yes_token_id) if yes_token_id else None
+        yes_bid = yes_bids.get(yes_token_id) if yes_token_id else None
+        yes_ask = yes_asks.get(yes_token_id) if yes_token_id else None
+        no_token_id = market.no_token_id or ""
+        no_mid = no_midpoints.get(no_token_id) if no_token_id else None
+        no_bid = no_bids.get(no_token_id) if no_token_id else None
+        no_ask = no_asks.get(no_token_id) if no_token_id else None
+        spread = compute_spread(yes_bid, yes_ask)
         conn.execute(
             """
             INSERT OR IGNORE INTO snapshots (
-                captured_at_utc, event_id, market_id, yes_token_id, yes_midpoint, yes_bid, yes_ask, spread
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                captured_at_utc, event_id, market_id, yes_token_id,
+                yes_midpoint, yes_bid, yes_ask, no_midpoint, no_bid, no_ask, spread
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (now, market.event_id, market.market_id, market.yes_token_id, mid, bid, ask, spread),
+            (now, market.event_id, market.market_id, market.yes_token_id, yes_mid, yes_bid, yes_ask, no_mid, no_bid, no_ask, spread),
         )
 
     def _mark_missing_markets_inactive(self, conn: sqlite3.Connection, current_market_ids: set[str]) -> None:
@@ -834,6 +1014,74 @@ class HighestTemperatureTracker:
             return
         placeholders = ",".join("?" for _ in current_market_ids)
         conn.execute(f"UPDATE markets SET active = 0 WHERE market_id NOT IN ({placeholders})", tuple(current_market_ids))
+
+    def _activate_event_tracking(self, conn: sqlite3.Connection, event_id: str, now: str) -> None:
+        conn.execute(
+            """
+            UPDATE events
+            SET tracking_active = 1,
+                tracking_started_at_utc = COALESCE(tracking_started_at_utc, ?),
+                tracking_stopped_at_utc = NULL
+            WHERE event_id = ?
+            """,
+            (now, event_id),
+        )
+
+    def _deactivate_stale_event_tracking(self, conn: sqlite3.Connection, now: str, grace_days: int) -> None:
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=grace_days)).isoformat()
+        conn.execute(
+            """
+            UPDATE events
+            SET tracking_active = 0,
+                tracking_stopped_at_utc = COALESCE(tracking_stopped_at_utc, ?)
+            WHERE tracking_active = 1
+              AND event_date_iso IS NOT NULL
+              AND date(event_date_iso) < date(?)
+            """,
+            (now, cutoff),
+        )
+
+    def _load_tracked_event_ids(self, conn: sqlite3.Connection) -> set[str]:
+        rows = conn.execute("SELECT event_id FROM events WHERE tracking_active = 1").fetchall()
+        return {str(row[0]) for row in rows}
+
+    def _deactivate_older_tracked_event_dates(self, conn: sqlite3.Connection, now: str) -> None:
+        rows = conn.execute(
+            """
+            SELECT event_id, event_date_iso
+            FROM events
+            WHERE tracking_active = 1
+            """
+        ).fetchall()
+        dated: list[tuple[str, date]] = []
+        for row in rows:
+            event_id = str(row[0])
+            event_date_iso = maybe_str(row[1])
+            if not event_date_iso:
+                continue
+            try:
+                parsed = datetime.strptime(event_date_iso, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            dated.append((event_id, parsed))
+
+        if not dated:
+            return
+
+        latest_date = max(item[1] for item in dated)
+        to_disable = [event_id for event_id, event_date in dated if event_date < latest_date]
+        if not to_disable:
+            return
+        placeholders = ",".join("?" for _ in to_disable)
+        conn.execute(
+            f"""
+            UPDATE events
+            SET tracking_active = 0,
+                tracking_stopped_at_utc = COALESCE(tracking_stopped_at_utc, ?)
+            WHERE event_id IN ({placeholders})
+            """,
+            (now, *to_disable),
+        )
 
 
     def _fetch_resolution_meta(self, event_url: str | None) -> dict[str, str] | None:
@@ -1100,6 +1348,8 @@ class HighestTemperatureTracker:
         for row in rows:
             token_id = row["yes_token_id"]
             if not token_id:
+                continue
+            if token_id not in midpoints and token_id not in bids and token_id not in asks:
                 continue
             current_mid = midpoints.get(token_id)
             current_bid = bids.get(token_id)
@@ -1408,6 +1658,12 @@ def compute_spread(bid: float | None, ask: float | None) -> float | None:
     return ask - bid
 
 
+def format_price(value: float | None) -> str:
+    if value is None:
+        return "NA"
+    return f"{value:.4f}"
+
+
 def collapse_space(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -1443,10 +1699,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE, help="Polymarket events page size")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="CLOB batch size")
     parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout in seconds")
+    parser.add_argument(
+        "--stop-tracking-days-after-event",
+        type=int,
+        default=DEFAULT_STOP_TRACKING_DAYS_AFTER_EVENT,
+        help="Keep tracking until this many days after event_date_iso (default: 1)",
+    )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
 
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("run-once", help="Fetch all active highest-temperature events and store one snapshot")
+    sub.add_parser("run-once", help="Discover new highest-temperature events and snapshot tracked ones")
 
     watch = sub.add_parser("watch-aligned", help="Run forever aligned to minutes 1,6,11,... by default")
     watch.add_argument("--interval-minutes", type=int, default=DEFAULT_POLL_MINUTES, help="Polling interval")
@@ -1460,6 +1722,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     report = sub.add_parser("report-picks", help="Print latest tracked forecast picks")
     report.add_argument("--limit", type=int, default=50, help="Max rows")
+
+    report_launch = sub.add_parser(
+        "report-launch",
+        help="Print launch prices per outcome (YES/NO) for latest events",
+    )
+    report_launch.add_argument("--limit-events", type=int, default=3, help="How many events")
     return parser
 
 
@@ -1483,12 +1751,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     if args.command == "run-once":
-        summary = tracker.run_once()
+        summary = tracker.run_once(stop_tracking_days_after_event=args.stop_tracking_days_after_event)
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return 0
 
     if args.command == "watch-aligned":
-        tracker.watch_aligned(interval_minutes=args.interval_minutes, start_minute=args.start_minute)
+        tracker.watch_aligned(
+            interval_minutes=args.interval_minutes,
+            start_minute=args.start_minute,
+            stop_tracking_days_after_event=args.stop_tracking_days_after_event,
+        )
         return 0
 
     if args.command == "export-csv":
@@ -1505,6 +1777,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         rows = tracker.report_picks(limit=args.limit)
         for row in rows:
             print(json.dumps(row, ensure_ascii=False))
+        return 0
+
+    if args.command == "report-launch":
+        rows = tracker.report_launch_prices(limit_events=args.limit_events)
+        if not rows:
+            print("No launch rows found")
+            return 0
+
+        current_event_id = None
+        for row in rows:
+            event_id = row.get("event_id")
+            if event_id != current_event_id:
+                current_event_id = event_id
+                print("")
+                print(f"Event: {row.get('event_title')}")
+                print(f"Launch seen: {row.get('launch_seen_at_utc')}")
+                forecast_target = row.get("forecast_target_market_unit")
+                forecast_unit = row.get("forecast_market_unit")
+                forecast_source = row.get("forecast_source_name")
+                if forecast_target is not None:
+                    print(
+                        "Forecast max: "
+                        f"{forecast_target}{forecast_unit or ''} "
+                        f"(source: {forecast_source or 'unknown'})"
+                    )
+                else:
+                    print("Forecast max: NA")
+                picked = row.get("picked_outcome_label")
+                if picked:
+                    print(f"Picked outcome: {picked}")
+                print("Outcomes at launch (SI / NO):")
+
+            print(
+                f"- {row.get('outcome_label')} | "
+                f"SI bid {format_price(row.get('initial_yes_bid'))} ask {format_price(row.get('initial_yes_ask'))} | "
+                f"NO bid {format_price(row.get('initial_no_bid'))} ask {format_price(row.get('initial_no_ask'))}"
+            )
         return 0
 
     return 2

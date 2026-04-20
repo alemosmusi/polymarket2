@@ -3,9 +3,12 @@
 Este script está pensado para la idea que describiste:
 
 - revisar **solo** mercados cuyo título empiece con `Highest temperature in`
-- correr alineado cada **5 minutos** en los minutos **1, 6, 11, 16, ...**
-- guardar precios **YES midpoint / best bid / best ask**
 - detectar **mercados nuevos**
+- activar seguimiento solo para esos mercados nuevos
+- guardar precios **YES y NO** (`midpoint / best bid / best ask`)
+- correr cada **5 minutos** y guardar cómo se mueve desde que apareció
+- guardar evolución solo para la **fecha de evento más nueva** (si aparece 23 de abril, deja de trackear 22 de abril)
+- cortar seguimiento automáticamente cuando pasa el día del evento (por defecto +1 día)
 - cuando aparece un evento nuevo, elegir una **apuesta teórica inicial** según el forecast:
   - primero intenta leer el forecast de la propia página de Polymarket
   - si no lo puede extraer, usa **Open-Meteo** como fallback
@@ -41,6 +44,12 @@ Ver picks teóricos guardados:
 python polymarket_highest_temp_tracker_v2.py report-picks --db polymarket_highest_temp.db
 ```
 
+Ver precios de salida por evento (sin evolución), con `SI/NO` por outcome y forecast:
+
+```bash
+python polymarket_highest_temp_tracker_v2.py report-launch --db polymarket_highest_temp.db --limit-events 3
+```
+
 Exportar todos los snapshots:
 
 ```bash
@@ -55,12 +64,16 @@ python polymarket_highest_temp_tracker_v2.py export-picks-csv --db polymarket_hi
 
 ## Cron
 
-Si prefieres cron en vez de loop interno, esta expresión corre exactamente en:
-
-`1,6,11,16,...,56`
+Si prefieres cron en vez de loop interno, para correr entre 04:00 y 10:55 cada 5 minutos:
 
 ```cron
-1-59/5 * * * * /usr/bin/python3 /ruta/polymarket_highest_temp_tracker_v2.py run-once --db /ruta/polymarket_highest_temp.db >> /ruta/polymarket_highest_temp.log 2>&1
+*/5 4-10 * * * /usr/bin/python3 /ruta/polymarket_highest_temp_tracker_v2.py run-once --db /ruta/polymarket_highest_temp.db >> /ruta/polymarket_highest_temp.log 2>&1
+```
+
+Si quieres mantener tracking mas tiempo despues del dia del evento:
+
+```bash
+python polymarket_highest_temp_tracker_v2.py --stop-tracking-days-after-event 2 run-once --db polymarket_highest_temp.db
 ```
 
 ## Qué guarda
