@@ -4,19 +4,17 @@ Este script está pensado para la idea que describiste:
 
 - revisar **solo** mercados cuyo título empiece con `Highest temperature in`
 - detectar **mercados nuevos**
-- activar seguimiento solo para esos mercados nuevos
-- guardar precios **YES y NO** (`midpoint / best bid / best ask`)
+- guardar solo la **fecha de evento más nueva** (si aparece 24 de abril, borra 23 y anteriores)
+- guardar precios **YES y NO explícitos** (`midpoint / best bid / best ask`)
 - correr cada **5 minutos** y guardar cómo se mueve desde que apareció
-- guardar evolución solo para la **fecha de evento más nueva** (si aparece 23 de abril, deja de trackear 22 de abril)
 - cortar seguimiento automáticamente cuando pasa el día del evento (por defecto +1 día)
 - cuando aparece un evento nuevo, elegir una **apuesta teórica inicial** según el forecast:
   - primero intenta leer el forecast de la propia página de Polymarket
   - si no lo puede extraer, usa **Open-Meteo** como fallback
-- buscar el outcome que coincide con esa máxima pronosticada y medir:
-  - precio de entrada (ask)
-  - bid actual
-  - mejor bid visto
-  - si habría habido ganancia bruta al vender en el interín
+- marcar la posición teórica del forecast:
+  - `YES` en el outcome que coincide con la máxima pronosticada
+  - `NO` en todos los demás outcomes del mismo evento
+  - siempre medir salida con el **bid** de ese lado (`YES bid` o `NO bid`)
 
 ## Instalación
 
@@ -62,6 +60,12 @@ Exportar picks teóricos:
 python polymarket_highest_temp_tracker_v2.py export-picks-csv --db polymarket_highest_temp.db --out picks.csv
 ```
 
+Exportar posiciones teóricas por market (`YES` al target del forecast, `NO` al resto):
+
+```bash
+python polymarket_highest_temp_tracker_v2.py export-forecast-positions-csv --db polymarket_highest_temp.db --out forecast_positions.csv
+```
+
 ## Cron
 
 Si prefieres cron en vez de loop interno, para correr entre 04:00 y 10:55 cada 5 minutos:
@@ -85,7 +89,7 @@ Un evento por mercado principal de Polymarket.
 Cada outcome binario del evento (`33°C`, `32°C`, `31°C or below`, etc.).
 
 ### snapshots
-Una fila por mercado y por timestamp capturado.
+Una fila por mercado y por timestamp capturado, con `YES` y `NO` explícitos.
 
 ### forecast_picks
 La apuesta teórica inicial por evento nuevo:
@@ -96,6 +100,13 @@ La apuesta teórica inicial por evento nuevo:
 - bid actual
 - mejor bid visto
 - PnL bruto teórico
+
+### forecast_positions
+Una fila por market para la estrategia teórica del forecast:
+- `YES` en el market objetivo
+- `NO` en todos los demás
+- entrada al `ask` de ese lado
+- salida al mejor `bid` visto de ese lado
 
 ## Importante
 

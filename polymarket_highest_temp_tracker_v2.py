@@ -266,10 +266,40 @@ class HighestTemperatureTracker:
                 """
             )
             conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS forecast_positions (
+                    market_id TEXT PRIMARY KEY,
+                    event_id TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    forecast_stance TEXT NOT NULL,
+                    target_market_id TEXT,
+                    target_outcome_label TEXT,
+                    entry_midpoint REAL,
+                    entry_bid REAL,
+                    entry_ask REAL,
+                    latest_midpoint REAL,
+                    latest_bid REAL,
+                    latest_ask REAL,
+                    best_exit_bid_seen REAL,
+                    best_exit_bid_seen_at_utc TEXT,
+                    gross_pnl_if_exit_now REAL,
+                    gross_pnl_at_best_exit REAL,
+                    raw_json TEXT,
+                    FOREIGN KEY(event_id) REFERENCES events(event_id),
+                    FOREIGN KEY(market_id) REFERENCES markets(market_id),
+                    FOREIGN KEY(target_market_id) REFERENCES markets(market_id)
+                )
+                """
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_markets_event ON markets(event_id)"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_snapshots_market_time ON snapshots(market_id, captured_at_utc)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_forecast_positions_event ON forecast_positions(event_id)"
             )
             self._run_schema_migrations(conn)
 
@@ -297,6 +327,9 @@ class HighestTemperatureTracker:
         now = utc_now_iso()
         events = list(self._fetch_active_events())
         highest_events = self._extract_highest_temp_events(events)
+        latest_event_date = select_latest_event_date(highest_events)
+        if latest_event_date:
+            highest_events = [event for event in highest_events if event.event_date_iso == latest_event_date]
         markets = self._extract_markets(highest_events)
 
         current_event_ids = {e.event_id for e in highest_events}
@@ -314,6 +347,8 @@ class HighestTemperatureTracker:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.row_factory = sqlite3.Row
+
+            purged_summary = self._purge_data_outside_event_date(conn, latest_event_date)
 
             existing_event_ids = {row[0] for row in conn.execute("SELECT event_id FROM events")}
             existing_market_ids = {row[0] for row in conn.execute("SELECT market_id FROM markets")}
@@ -365,6 +400,13 @@ class HighestTemperatureTracker:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.row_factory = sqlite3.Row
 
+            forecast_pick_event_ids = {
+                str(row[0]) for row in conn.execute("SELECT event_id FROM forecast_picks")
+            }
+            forecast_position_event_ids = {
+                str(row[0]) for row in conn.execute("SELECT DISTINCT event_id FROM forecast_positions")
+            }
+
             for market in tracked_markets:
                 is_new = market.market_id not in existing_market_ids
                 self._upsert_market(
@@ -392,8 +434,14 @@ class HighestTemperatureTracker:
                 )
                 snapshot_count += 1
 
-            # Create first-seen forecast picks for newly discovered tracked events only.
-            for event_id in new_event_ids:
+            forecast_needed_event_ids = {
+                event_id
+                for event_id in tracked_event_ids
+                if event_id not in forecast_pick_event_ids or event_id not in forecast_position_event_ids
+            }
+
+            # Create first-seen forecast state for events that do not have it yet.
+            for event_id in sorted(forecast_needed_event_ids):
                 if event_id not in tracked_event_ids:
                     continue
                 event = event_by_id.get(event_id)
@@ -419,20 +467,49 @@ class HighestTemperatureTracker:
                     )
                 forecast = self._get_initial_forecast(event, event_markets)
                 if forecast:
-                    self._create_forecast_pick(conn, event, event_markets, forecast, now, yes_midpoints, yes_bids, yes_asks)
+                    if event_id not in forecast_pick_event_ids:
+                        self._create_forecast_pick(conn, event, event_markets, forecast, now, yes_midpoints, yes_bids, yes_asks)
+                    if event_id not in forecast_position_event_ids:
+                        self._create_forecast_positions(
+                            conn,
+                            event,
+                            event_markets,
+                            forecast,
+                            now,
+                            yes_midpoints,
+                            yes_bids,
+                            yes_asks,
+                            no_midpoints,
+                            no_bids,
+                            no_asks,
+                        )
 
             # Update existing forecast picks with current prices.
             self._refresh_forecast_picks(conn, now, yes_midpoints, yes_bids, yes_asks)
+            self._refresh_forecast_positions(
+                conn,
+                now,
+                yes_midpoints,
+                yes_bids,
+                yes_asks,
+                no_midpoints,
+                no_bids,
+                no_asks,
+            )
             conn.commit()
 
         return {
             "events_scanned": len(events),
             "highest_temp_events": len(highest_events),
+            "latest_event_date": latest_event_date,
             "markets_discovered": len(markets),
             "markets_tracked": len(tracked_markets),
             "new_events": new_events,
             "new_markets": new_markets,
             "snapshots_inserted": snapshot_count,
+            "purged_events": purged_summary["events"],
+            "purged_markets": purged_summary["markets"],
+            "purged_snapshots": purged_summary["snapshots"],
         }
 
     def watch_aligned(
@@ -516,6 +593,7 @@ class HighestTemperatureTracker:
                 m.initial_yes_ask,
                 m.initial_no_bid,
                 m.initial_no_ask,
+                fpos.forecast_stance,
                 fp.forecast_method,
                 fp.forecast_source_name,
                 fp.forecast_target_market_unit,
@@ -524,6 +602,7 @@ class HighestTemperatureTracker:
             FROM latest_events le
             JOIN markets m ON m.event_id = le.event_id
             LEFT JOIN forecast_picks fp ON fp.event_id = le.event_id
+            LEFT JOIN forecast_positions fpos ON fpos.market_id = m.market_id
             ORDER BY
                 le.launch_seen_at_utc DESC,
                 le.event_title ASC,
@@ -610,6 +689,43 @@ class HighestTemperatureTracker:
             FROM forecast_picks fp
             JOIN events e ON e.event_id = fp.event_id
             ORDER BY fp.created_at_utc ASC
+        """
+        count = 0
+        with sqlite3.connect(self.db_path) as conn, open(output_path, "w", newline="", encoding="utf-8") as f:
+            cursor = conn.execute(query)
+            writer = csv.writer(f)
+            writer.writerow([col[0] for col in cursor.description])
+            for row in cursor:
+                writer.writerow(row)
+                count += 1
+        return count
+
+    def export_forecast_positions_csv(self, output_path: str) -> int:
+        query = """
+            SELECT
+                e.title AS event_title,
+                e.event_url,
+                fp.created_at_utc,
+                fp.updated_at_utc,
+                fp.forecast_stance,
+                fp.target_outcome_label,
+                m.market_id,
+                m.outcome_label,
+                m.unit,
+                fp.entry_midpoint,
+                fp.entry_bid,
+                fp.entry_ask,
+                fp.latest_midpoint,
+                fp.latest_bid,
+                fp.latest_ask,
+                fp.best_exit_bid_seen,
+                fp.best_exit_bid_seen_at_utc,
+                fp.gross_pnl_if_exit_now,
+                fp.gross_pnl_at_best_exit
+            FROM forecast_positions fp
+            JOIN markets m ON m.market_id = fp.market_id
+            JOIN events e ON e.event_id = fp.event_id
+            ORDER BY fp.created_at_utc ASC, e.title ASC, m.outcome_label ASC
         """
         count = 0
         with sqlite3.connect(self.db_path) as conn, open(output_path, "w", newline="", encoding="utf-8") as f:
@@ -1009,6 +1125,56 @@ class HighestTemperatureTracker:
             (now, market.event_id, market.market_id, market.yes_token_id, yes_mid, yes_bid, yes_ask, no_mid, no_bid, no_ask, spread),
         )
 
+    def _purge_data_outside_event_date(
+        self,
+        conn: sqlite3.Connection,
+        keep_event_date_iso: str | None,
+    ) -> dict[str, int]:
+        summary = {
+            "events": 0,
+            "markets": 0,
+            "snapshots": 0,
+            "forecast_picks": 0,
+            "forecast_positions": 0,
+        }
+        if not keep_event_date_iso:
+            return summary
+
+        rows = conn.execute(
+            """
+            SELECT event_id
+            FROM events
+            WHERE event_date_iso IS NULL OR event_date_iso <> ?
+            """,
+            (keep_event_date_iso,),
+        ).fetchall()
+        event_ids = [str(row[0]) for row in rows]
+        if not event_ids:
+            return summary
+
+        placeholders = ",".join("?" for _ in event_ids)
+        summary["snapshots"] = conn.execute(
+            f"DELETE FROM snapshots WHERE event_id IN ({placeholders})",
+            tuple(event_ids),
+        ).rowcount
+        summary["forecast_positions"] = conn.execute(
+            f"DELETE FROM forecast_positions WHERE event_id IN ({placeholders})",
+            tuple(event_ids),
+        ).rowcount
+        summary["forecast_picks"] = conn.execute(
+            f"DELETE FROM forecast_picks WHERE event_id IN ({placeholders})",
+            tuple(event_ids),
+        ).rowcount
+        summary["markets"] = conn.execute(
+            f"DELETE FROM markets WHERE event_id IN ({placeholders})",
+            tuple(event_ids),
+        ).rowcount
+        summary["events"] = conn.execute(
+            f"DELETE FROM events WHERE event_id IN ({placeholders})",
+            tuple(event_ids),
+        ).rowcount
+        return summary
+
     def _mark_missing_markets_inactive(self, conn: sqlite3.Connection, current_market_ids: set[str]) -> None:
         if not current_market_ids:
             return
@@ -1326,6 +1492,81 @@ class HighestTemperatureTracker:
             ),
         )
 
+    def _create_forecast_positions(
+        self,
+        conn: sqlite3.Connection,
+        event: EventRecord,
+        event_markets: Sequence[MarketRecord],
+        forecast: ForecastInfo,
+        now: str,
+        yes_midpoints: dict[str, float | None],
+        yes_bids: dict[str, float | None],
+        yes_asks: dict[str, float | None],
+        no_midpoints: dict[str, float | None],
+        no_bids: dict[str, float | None],
+        no_asks: dict[str, float | None],
+    ) -> None:
+        target_market = choose_market_for_target(
+            markets=event_markets,
+            target_value=forecast.target_value_market_unit,
+            market_unit=forecast.market_unit,
+        )
+        target_market_id = target_market.market_id if target_market else None
+        target_outcome_label = target_market.outcome_label if target_market else None
+
+        for market in event_markets:
+            is_target = target_market_id == market.market_id
+            stance = "YES" if is_target else "NO"
+            midpoint_map = yes_midpoints if is_target else no_midpoints
+            bid_map = yes_bids if is_target else no_bids
+            ask_map = yes_asks if is_target else no_asks
+            token_id = market.yes_token_id if is_target else market.no_token_id
+            entry_mid = midpoint_map.get(token_id) if token_id else None
+            entry_bid = bid_map.get(token_id) if token_id else None
+            entry_ask = ask_map.get(token_id) if token_id else None
+            gross_now = compute_profit(entry_ask, entry_bid)
+
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO forecast_positions (
+                    market_id, event_id, created_at_utc, updated_at_utc,
+                    forecast_stance, target_market_id, target_outcome_label,
+                    entry_midpoint, entry_bid, entry_ask,
+                    latest_midpoint, latest_bid, latest_ask,
+                    best_exit_bid_seen, best_exit_bid_seen_at_utc,
+                    gross_pnl_if_exit_now, gross_pnl_at_best_exit,
+                    raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    market.market_id,
+                    event.event_id,
+                    now,
+                    now,
+                    stance,
+                    target_market_id,
+                    target_outcome_label,
+                    entry_mid,
+                    entry_bid,
+                    entry_ask,
+                    entry_mid,
+                    entry_bid,
+                    entry_ask,
+                    entry_bid,
+                    now if entry_bid is not None else None,
+                    gross_now,
+                    gross_now,
+                    json.dumps(
+                        {
+                            "forecast_target_market_unit": forecast.target_value_market_unit,
+                            "forecast_market_unit": forecast.market_unit,
+                            "event_city": event.city,
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+
     def _refresh_forecast_picks(
         self,
         conn: sqlite3.Connection,
@@ -1404,6 +1645,78 @@ class HighestTemperatureTracker:
                 ),
             )
 
+    def _refresh_forecast_positions(
+        self,
+        conn: sqlite3.Connection,
+        now: str,
+        yes_midpoints: dict[str, float | None],
+        yes_bids: dict[str, float | None],
+        yes_asks: dict[str, float | None],
+        no_midpoints: dict[str, float | None],
+        no_bids: dict[str, float | None],
+        no_asks: dict[str, float | None],
+    ) -> None:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT fp.market_id, fp.event_id, fp.forecast_stance, fp.entry_ask,
+                   fp.best_exit_bid_seen, m.yes_token_id, m.no_token_id
+            FROM forecast_positions fp
+            JOIN markets m ON m.market_id = fp.market_id
+            """
+        ).fetchall()
+
+        for row in rows:
+            use_yes = row["forecast_stance"] == "YES"
+            token_id = row["yes_token_id"] if use_yes else row["no_token_id"]
+            if not token_id:
+                continue
+
+            midpoint_map = yes_midpoints if use_yes else no_midpoints
+            bid_map = yes_bids if use_yes else no_bids
+            ask_map = yes_asks if use_yes else no_asks
+            if token_id not in midpoint_map and token_id not in bid_map and token_id not in ask_map:
+                continue
+
+            current_mid = midpoint_map.get(token_id)
+            current_bid = bid_map.get(token_id)
+            current_ask = ask_map.get(token_id)
+            best_exit_bid_seen = row["best_exit_bid_seen"]
+            best_exit_bid_seen_at = None
+            if current_bid is not None and (best_exit_bid_seen is None or current_bid > best_exit_bid_seen):
+                best_exit_bid_seen = current_bid
+                best_exit_bid_seen_at = now
+
+            entry_ask = row["entry_ask"]
+            gross_now = compute_profit(entry_ask, current_bid)
+            gross_best = compute_profit(entry_ask, best_exit_bid_seen)
+
+            conn.execute(
+                """
+                UPDATE forecast_positions
+                SET updated_at_utc = ?,
+                    latest_midpoint = ?,
+                    latest_bid = ?,
+                    latest_ask = ?,
+                    best_exit_bid_seen = ?,
+                    best_exit_bid_seen_at_utc = COALESCE(?, best_exit_bid_seen_at_utc),
+                    gross_pnl_if_exit_now = ?,
+                    gross_pnl_at_best_exit = ?
+                WHERE market_id = ?
+                """,
+                (
+                    now,
+                    current_mid,
+                    current_bid,
+                    current_ask,
+                    best_exit_bid_seen,
+                    best_exit_bid_seen_at,
+                    gross_now,
+                    gross_best,
+                    row["market_id"],
+                ),
+            )
+
 
 def parse_highest_temp_title(title: str) -> dict[str, str | None]:
     match = re.match(r"^Highest temperature in (?P<city>.+?) on (?P<when>.+?)\?$", title.strip(), flags=re.IGNORECASE)
@@ -1413,6 +1726,13 @@ def parse_highest_temp_title(title: str) -> dict[str, str | None]:
     when_text = match.group("when").strip()
     event_date_iso = parse_flexible_date(when_text)
     return {"city": city, "event_date_iso": event_date_iso}
+
+
+def select_latest_event_date(events: Sequence[EventRecord]) -> str | None:
+    dated = sorted({event.event_date_iso for event in events if event.event_date_iso})
+    if not dated:
+        return None
+    return dated[-1]
 
 
 def parse_flexible_date(text: str) -> str | None:
@@ -1436,46 +1756,57 @@ def parse_flexible_date(text: str) -> str | None:
 def parse_outcome_range(label: str) -> dict[str, float | None]:
     text = collapse_space(label.strip())
 
-    # Outcome labels often come in as full questions, e.g.
-    # "Will the highest temperature in Milan be 21°C on April 21?"
-    # or "Will the highest temperature in Milan be 12°C or below on April 21?"
-    # Extract the temperature fragment after "be" and before the date/question ending.
-    question_match = re.search(
-        r"\bbe\s+(-?\d+(?:\.\d+)?\s*°?\s*[CF](?:\s*or\s*(?:below|higher|above))?(?:\s*-\s*-?\d+(?:\.\d+)?\s*°?\s*[CF])?)",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if question_match:
-        text = collapse_space(question_match.group(1))
+    patterns = [
+        (
+            re.compile(
+                r"(?:between\s+)?(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*°?\s*([CF])",
+                flags=re.IGNORECASE,
+            ),
+            "range",
+        ),
+        (
+            re.compile(
+                r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])\s+or\s+below",
+                flags=re.IGNORECASE,
+            ),
+            "low",
+        ),
+        (
+            re.compile(
+                r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])\s+or\s+(?:higher|above)",
+                flags=re.IGNORECASE,
+            ),
+            "high",
+        ),
+        (
+            re.compile(
+                r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])",
+                flags=re.IGNORECASE,
+            ),
+            "exact",
+        ),
+    ]
 
-    # Exact single value like "33°C"
-    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])", text, flags=re.IGNORECASE)
-    if m:
-        value = float(m.group(1))
-        unit = m.group(2).upper()
+    for pattern, kind in patterns:
+        match = pattern.search(text)
+        if not match:
+            continue
+        if kind == "range":
+            low = float(match.group(1))
+            high = float(match.group(2))
+            unit = match.group(3).upper()
+            return {"lower_bound": min(low, high), "upper_bound": max(low, high), "unit": unit}
+        if kind == "low":
+            value = float(match.group(1))
+            unit = match.group(2).upper()
+            return {"lower_bound": None, "upper_bound": value, "unit": unit}
+        if kind == "high":
+            value = float(match.group(1))
+            unit = match.group(2).upper()
+            return {"lower_bound": value, "upper_bound": None, "unit": unit}
+        value = float(match.group(1))
+        unit = match.group(2).upper()
         return {"lower_bound": value, "upper_bound": value, "unit": unit}
-
-    # Range like "63-64°F"
-    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)\s*°?\s*([CF])", text, flags=re.IGNORECASE)
-    if m:
-        low = float(m.group(1))
-        high = float(m.group(2))
-        unit = m.group(3).upper()
-        return {"lower_bound": min(low, high), "upper_bound": max(low, high), "unit": unit}
-
-    # "21°C or below"
-    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])\s+or\s+below", text, flags=re.IGNORECASE)
-    if m:
-        value = float(m.group(1))
-        unit = m.group(2).upper()
-        return {"lower_bound": None, "upper_bound": value, "unit": unit}
-
-    # "31°C or higher" / "31°C or above"
-    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)\s*°?\s*([CF])\s+or\s+(?:higher|above)", text, flags=re.IGNORECASE)
-    if m:
-        value = float(m.group(1))
-        unit = m.group(2).upper()
-        return {"lower_bound": value, "upper_bound": None, "unit": unit}
 
     return {"lower_bound": None, "upper_bound": None, "unit": infer_unit_from_text(text)}
 
@@ -1720,6 +2051,12 @@ def build_parser() -> argparse.ArgumentParser:
     export_picks = sub.add_parser("export-picks-csv", help="Export event-level forecast picks to CSV")
     export_picks.add_argument("--out", required=True, help="Output CSV path")
 
+    export_forecast_positions = sub.add_parser(
+        "export-forecast-positions-csv",
+        help="Export per-market forecast YES/NO positions to CSV",
+    )
+    export_forecast_positions.add_argument("--out", required=True, help="Output CSV path")
+
     report = sub.add_parser("report-picks", help="Print latest tracked forecast picks")
     report.add_argument("--limit", type=int, default=50, help="Max rows")
 
@@ -1773,6 +2110,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Exported {rows} forecast-pick rows to {args.out}")
         return 0
 
+    if args.command == "export-forecast-positions-csv":
+        rows = tracker.export_forecast_positions_csv(args.out)
+        print(f"Exported {rows} forecast-position rows to {args.out}")
+        return 0
+
     if args.command == "report-picks":
         rows = tracker.report_picks(limit=args.limit)
         for row in rows:
@@ -1810,7 +2152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("Outcomes at launch (SI / NO):")
 
             print(
-                f"- {row.get('outcome_label')} | "
+                f"- [{row.get('forecast_stance') or '-'}] {row.get('outcome_label')} | "
                 f"SI bid {format_price(row.get('initial_yes_bid'))} ask {format_price(row.get('initial_yes_ask'))} | "
                 f"NO bid {format_price(row.get('initial_no_bid'))} ask {format_price(row.get('initial_no_ask'))}"
             )

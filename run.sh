@@ -14,6 +14,7 @@ python polymarket_highest_temp_tracker_v2.py \
   run-once
 python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-csv --out data/snapshots.csv
 python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-picks-csv --out data/picks.csv
+python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-forecast-positions-csv --out data/forecast_positions.csv
 
 TMP_REPO="/tmp/repo"
 rm -rf "$TMP_REPO"
@@ -29,6 +30,7 @@ mkdir -p data
 cp /app/data/polymarket_highest_temp.db data/
 cp /app/data/snapshots.csv data/
 cp /app/data/picks.csv data/
+cp /app/data/forecast_positions.csv data/
 
 git add data/
 
