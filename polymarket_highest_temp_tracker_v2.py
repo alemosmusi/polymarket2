@@ -343,6 +343,13 @@ class HighestTemperatureTracker:
         existing_market_ids: set[str] = set()
         tracked_event_ids: set[str] = set()
         new_event_ids: set[str] = set()
+        purged_summary = {
+            "events": 0,
+            "markets": 0,
+            "snapshots": 0,
+            "forecast_picks": 0,
+            "forecast_positions": 0,
+        }
 
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -497,6 +504,9 @@ class HighestTemperatureTracker:
                 no_asks,
             )
             conn.commit()
+
+        if any(count > 0 for count in purged_summary.values()):
+            self._compact_db()
 
         return {
             "events_scanned": len(events),
@@ -1174,6 +1184,12 @@ class HighestTemperatureTracker:
             tuple(event_ids),
         ).rowcount
         return summary
+
+    def _compact_db(self) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("VACUUM")
 
     def _mark_missing_markets_inactive(self, conn: sqlite3.Connection, current_market_ids: set[str]) -> None:
         if not current_market_ids:

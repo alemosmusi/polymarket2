@@ -7,6 +7,7 @@ Este script está pensado para la idea que describiste:
 - guardar solo la **fecha de evento más nueva** (si aparece 24 de abril, borra 23 y anteriores)
 - guardar precios **YES y NO explícitos** (`midpoint / best bid / best ask`)
 - correr cada **5 minutos** y guardar cómo se mueve desde que apareció
+- durante la ventana inicial corre cada **1 minuto** y después baja solo a cada **5 minutos**
 - cortar seguimiento automáticamente cuando pasa el día del evento (por defecto +1 día)
 - cuando aparece un evento nuevo, elegir una **apuesta teórica inicial** según el forecast:
   - primero intenta leer el forecast de la propia página de Polymarket
@@ -68,10 +69,24 @@ python polymarket_highest_temp_tracker_v2.py export-forecast-positions-csv --db 
 
 ## Cron
 
-Si prefieres cron en vez de loop interno, para correr entre 04:00 y 10:55 cada 5 minutos:
+Si usas Railway, ahora lo más simple es programarlo **cada minuto** y dejar que `run.sh` decida:
+- de `04:00` a `05:30` corre cada `1 minuto`
+- de `05:31` a `10:59` corre solo en minutos múltiplos de `5`
+- fuera de esa ventana hace `skip`
 
 ```cron
-*/5 4-10 * * * /usr/bin/python3 /ruta/polymarket_highest_temp_tracker_v2.py run-once --db /ruta/polymarket_highest_temp.db >> /ruta/polymarket_highest_temp.log 2>&1
+* 4-10 * * *
+```
+
+Variables útiles en Railway:
+
+```bash
+TRACKER_TIMEZONE=Europe/Madrid
+FAST_START_HOUR=4
+FAST_END_HOUR=5
+FAST_END_MINUTE=30
+ACTIVE_END_HOUR=10
+SLOW_INTERVAL_MINUTES=5
 ```
 
 Si quieres mantener tracking mas tiempo despues del dia del evento:
@@ -107,6 +122,12 @@ Una fila por market para la estrategia teórica del forecast:
 - `NO` en todos los demás
 - entrada al `ask` de ese lado
 - salida al mejor `bid` visto de ese lado
+
+## GitHub
+
+- El repo ya no necesita versionar `data/polymarket_highest_temp.db`
+- se recomienda subir solo `snapshots.csv`, `picks.csv` y `forecast_positions.csv`
+- la DB local se compacta automáticamente cuando cambia el día tracked
 
 ## Importante
 

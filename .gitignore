@@ -1,5 +1,6 @@
 .DS_Store
 __pycache__/
 *.pyc
+data/polymarket_highest_temp.db
 data/*.db-wal
 data/*.db-shm

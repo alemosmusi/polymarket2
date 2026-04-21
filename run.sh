@@ -6,6 +6,33 @@ cd /app
 mkdir -p data
 
 STOP_TRACKING_DAYS_AFTER_EVENT="${STOP_TRACKING_DAYS_AFTER_EVENT:-1}"
+TRACKER_TIMEZONE="${TRACKER_TIMEZONE:-Europe/Madrid}"
+FAST_START_HOUR="${FAST_START_HOUR:-4}"
+FAST_END_HOUR="${FAST_END_HOUR:-5}"
+FAST_END_MINUTE="${FAST_END_MINUTE:-30}"
+ACTIVE_END_HOUR="${ACTIVE_END_HOUR:-10}"
+SLOW_INTERVAL_MINUTES="${SLOW_INTERVAL_MINUTES:-5}"
+
+CURRENT_HOUR="$(TZ="${TRACKER_TIMEZONE}" date +%H)"
+CURRENT_MINUTE="$(TZ="${TRACKER_TIMEZONE}" date +%M)"
+CURRENT_TOTAL_MINUTES=$((10#${CURRENT_HOUR} * 60 + 10#${CURRENT_MINUTE}))
+FAST_START_TOTAL_MINUTES=$((10#${FAST_START_HOUR} * 60))
+FAST_END_TOTAL_MINUTES=$((10#${FAST_END_HOUR} * 60 + 10#${FAST_END_MINUTE}))
+ACTIVE_END_TOTAL_MINUTES=$((10#${ACTIVE_END_HOUR} * 60 + 59))
+
+SHOULD_RUN=0
+if (( CURRENT_TOTAL_MINUTES >= FAST_START_TOTAL_MINUTES && CURRENT_TOTAL_MINUTES <= FAST_END_TOTAL_MINUTES )); then
+  SHOULD_RUN=1
+elif (( CURRENT_TOTAL_MINUTES > FAST_END_TOTAL_MINUTES && CURRENT_TOTAL_MINUTES <= ACTIVE_END_TOTAL_MINUTES )); then
+  if (( 10#${CURRENT_MINUTE} % 10#${SLOW_INTERVAL_MINUTES} == 0 )); then
+    SHOULD_RUN=1
+  fi
+fi
+
+if (( SHOULD_RUN == 0 )); then
+  echo "Skipping run at ${CURRENT_HOUR}:${CURRENT_MINUTE} ${TRACKER_TIMEZONE}"
+  exit 0
+fi
 
 python polymarket_highest_temp_tracker_v2.py \
   --db data/polymarket_highest_temp.db \
@@ -27,12 +54,12 @@ git config user.name "${GIT_USER_NAME}"
 git config user.email "${GIT_USER_EMAIL}"
 
 mkdir -p data
-cp /app/data/polymarket_highest_temp.db data/
 cp /app/data/snapshots.csv data/
 cp /app/data/picks.csv data/
 cp /app/data/forecast_positions.csv data/
+rm -f data/polymarket_highest_temp.db
 
-git add data/
+git add -A data/
 
 if git diff --cached --quiet; then
   echo "No changes to commit"
