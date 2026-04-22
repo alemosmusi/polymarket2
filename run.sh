@@ -39,6 +39,79 @@ python polymarket_highest_temp_tracker_v2.py \
   --batch-size 25 \
   --stop-tracking-days-after-event "${STOP_TRACKING_DAYS_AFTER_EVENT}" \
   run-once
+
+python - <<'PY'
+import sqlite3
+import sys
+
+db_path = "data/polymarket_highest_temp.db"
+required_market_columns = {
+    "initial_no_midpoint",
+    "initial_no_bid",
+    "initial_no_ask",
+    "latest_no_midpoint",
+    "latest_no_bid",
+    "latest_no_ask",
+}
+required_snapshot_columns = {"no_midpoint", "no_bid", "no_ask"}
+
+with sqlite3.connect(db_path) as conn:
+    tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "forecast_positions" not in tables:
+        raise SystemExit("Sanity check failed: forecast_positions table is missing")
+
+    market_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(markets)")
+    }
+    snapshot_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(snapshots)")
+    }
+    missing_market_columns = sorted(required_market_columns - market_columns)
+    missing_snapshot_columns = sorted(required_snapshot_columns - snapshot_columns)
+    if missing_market_columns:
+        raise SystemExit(
+            "Sanity check failed: markets is missing NO columns: "
+            + ", ".join(missing_market_columns)
+        )
+    if missing_snapshot_columns:
+        raise SystemExit(
+            "Sanity check failed: snapshots is missing NO columns: "
+            + ", ".join(missing_snapshot_columns)
+        )
+
+    distinct_event_dates = conn.execute(
+        """
+        SELECT COUNT(DISTINCT event_date_iso)
+        FROM events
+        WHERE event_date_iso IS NOT NULL
+        """
+    ).fetchone()[0]
+    if distinct_event_dates > 1:
+        raise SystemExit(
+            f"Sanity check failed: expected only one event_date_iso, found {distinct_event_dates}"
+        )
+
+    tracked_dates = conn.execute(
+        """
+        SELECT COUNT(DISTINCT e.event_date_iso)
+        FROM snapshots s
+        JOIN events e ON e.event_id = s.event_id
+        WHERE e.event_date_iso IS NOT NULL
+        """
+    ).fetchone()[0]
+    if tracked_dates > 1:
+        raise SystemExit(
+            f"Sanity check failed: snapshots still contain {tracked_dates} event dates"
+        )
+
+print("Sanity check OK: explicit NO columns and latest-day-only data are present")
+PY
+
 python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-csv --out data/snapshots.csv
 python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-picks-csv --out data/picks.csv
 python polymarket_highest_temp_tracker_v2.py --db data/polymarket_highest_temp.db export-forecast-positions-csv --out data/forecast_positions.csv
